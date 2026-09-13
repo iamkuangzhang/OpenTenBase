@@ -15,17 +15,275 @@
 #include "varatt.h"
 #endif
 
+typedef struct IvfflatKmeansMemoryEstimate
+{
+	int			numSamples;
+	int			numCenters;
+	int			dimensions;
+	int			numGroups;
+	Size		memoryUsed;
+	Size		initTotalSize;
+	Size		mainTotalSize;
+	Size		totalSize;
+	Size		initWeightSize;
+	Size		newCentersSize;
+	Size		aggSize;
+	Size		centerCountsSize;
+	Size		closestCentersSize;
+	Size		lowerBoundSize;
+	Size		upperBoundSize;
+	Size		sSize;
+	Size		halfcdistSize;
+	Size		newcdistSize;
+	Size		groupLowerBoundSize;
+	Size		centerGroupSize;
+	Size		groupOffsetsSize;
+	Size		groupMembersSize;
+	Size		groupCountsSize;
+	Size		centerDriftSize;
+	Size		groupMaxDriftSize;
+	Size		tmpGroupFloatSize;
+	Size		tmpGroupIntSize;
+	Size		tmpGroupBoolSize;
+	Size		groupCentersSize;
+	Size		groupAggSize;
+	Size		groupBuildMembersPosSize;
+}			IvfflatKmeansMemoryEstimate;
+
+typedef enum IvfflatKmeansAlgorithm
+{
+	IVFFLAT_KMEANS_ELKAN,
+	IVFFLAT_KMEANS_YINYANG
+}			IvfflatKmeansAlgorithm;
+
+typedef struct IvfflatKmeansSelection
+{
+	IvfflatKmeansAlgorithm algorithm;
+	IvfflatKmeansMemoryEstimate elkanEstimate;
+	IvfflatKmeansMemoryEstimate yinyangEstimate;
+}			IvfflatKmeansSelection;
+
+/*
+ * Convert to the same kB unit used by IvfflatCheckMemoryUsage.
+ */
+static Size
+KmeansMemorySizeToKB(Size totalSize)
+{
+	return totalSize / 1024;
+}
+
+/*
+ * Convert kB to a ceiling MB value for human-readable diagnostics.
+ */
+static Size
+KmeansMemoryKBToMB(Size totalKB)
+{
+	return totalKB / 1024 + (totalKB % 1024 != 0);
+}
+
+/*
+ * Convert bytes to a fit-semantics-aligned MB display value.
+ */
+static Size
+KmeansMemorySizeToMB(Size totalSize)
+{
+	return KmeansMemoryKBToMB(KmeansMemorySizeToKB(totalSize));
+}
+
+/*
+ * Check memory against maintenance_work_mem with existing pgvector semantics.
+ */
+static bool
+IvfflatKmeansMemoryFits(Size totalSize)
+{
+	return totalSize / 1024 <= (Size) maintenance_work_mem;
+}
+
+/*
+ * Estimate memory for Elkan k-means
+ */
+static void
+EstimateElkanKmeansMemory(int numSamples, int numCenters, int dimensions, Size itemsize, Size memoryUsed, IvfflatKmeansMemoryEstimate * estimate)
+{
+	Size		totalSize = memoryUsed;
+
+	memset(estimate, 0, sizeof(IvfflatKmeansMemoryEstimate));
+	estimate->numSamples = numSamples;
+	estimate->numCenters = numCenters;
+	estimate->dimensions = dimensions;
+	estimate->memoryUsed = memoryUsed;
+
+	estimate->initWeightSize = mul_size(sizeof(float), numSamples);
+	estimate->newCentersSize = VECTOR_ARRAY_SIZE(numCenters, itemsize);
+	estimate->aggSize = mul_size(sizeof(float), mul_size(numCenters, dimensions));
+	estimate->centerCountsSize = mul_size(sizeof(int), numCenters);
+	estimate->closestCentersSize = mul_size(sizeof(int), numSamples);
+	estimate->lowerBoundSize = mul_size(sizeof(float), mul_size(numSamples, numCenters));
+	estimate->upperBoundSize = mul_size(sizeof(float), numSamples);
+	estimate->sSize = mul_size(sizeof(float), numCenters);
+	estimate->halfcdistSize = mul_size(sizeof(float), mul_size(numCenters, numCenters));
+	estimate->newcdistSize = mul_size(sizeof(float), numCenters);
+
+	totalSize = add_size(totalSize, estimate->newCentersSize);
+	totalSize = add_size(totalSize, estimate->aggSize);
+	totalSize = add_size(totalSize, estimate->centerCountsSize);
+	totalSize = add_size(totalSize, estimate->closestCentersSize);
+	totalSize = add_size(totalSize, estimate->lowerBoundSize);
+	totalSize = add_size(totalSize, estimate->upperBoundSize);
+	totalSize = add_size(totalSize, estimate->sSize);
+	totalSize = add_size(totalSize, estimate->halfcdistSize);
+	totalSize = add_size(totalSize, estimate->newcdistSize);
+
+	estimate->mainTotalSize = totalSize;
+	estimate->initTotalSize = add_size(totalSize, estimate->initWeightSize);
+	estimate->totalSize = estimate->initTotalSize;
+}
+
+/*
+ * Estimate memory for Yinyang k-means
+ */
+static void
+EstimateYinyangKmeansMemory(int numSamples, int numCenters, int dimensions, Size itemsize, Size memoryUsed, IvfflatKmeansMemoryEstimate * estimate)
+{
+	Size		mainTotalSize = memoryUsed;
+
+	memset(estimate, 0, sizeof(IvfflatKmeansMemoryEstimate));
+	estimate->numSamples = numSamples;
+	estimate->numCenters = numCenters;
+	estimate->dimensions = dimensions;
+	estimate->numGroups = Max(numCenters / 10, 1);
+	estimate->memoryUsed = memoryUsed;
+
+	estimate->initWeightSize = mul_size(sizeof(float), numSamples);
+	estimate->newCentersSize = VECTOR_ARRAY_SIZE(numCenters, itemsize);
+	estimate->aggSize = mul_size(sizeof(float), mul_size(numCenters, dimensions));
+	estimate->centerCountsSize = mul_size(sizeof(int), numCenters);
+	estimate->closestCentersSize = mul_size(sizeof(int), numSamples);
+	estimate->upperBoundSize = mul_size(sizeof(float), numSamples);
+	estimate->groupLowerBoundSize = mul_size(sizeof(float), mul_size(numSamples, estimate->numGroups));
+	estimate->centerGroupSize = mul_size(sizeof(int), numCenters);
+	estimate->groupOffsetsSize = mul_size(sizeof(int), estimate->numGroups + 1);
+	estimate->groupMembersSize = mul_size(sizeof(int), numCenters);
+	estimate->groupCountsSize = mul_size(sizeof(int), estimate->numGroups);
+	estimate->centerDriftSize = mul_size(sizeof(float), numCenters);
+	estimate->groupMaxDriftSize = mul_size(sizeof(float), estimate->numGroups);
+	estimate->tmpGroupFloatSize = mul_size(sizeof(float), estimate->numGroups);
+	estimate->tmpGroupIntSize = mul_size(sizeof(int), estimate->numGroups);
+	estimate->tmpGroupBoolSize = mul_size(sizeof(bool), estimate->numGroups);
+	estimate->groupCentersSize = VECTOR_ARRAY_SIZE(estimate->numGroups, itemsize);
+	estimate->groupAggSize = mul_size(sizeof(float), mul_size(estimate->numGroups, dimensions));
+	estimate->groupBuildMembersPosSize = mul_size(sizeof(int), estimate->numGroups);
+
+	mainTotalSize = add_size(mainTotalSize, estimate->newCentersSize);
+	mainTotalSize = add_size(mainTotalSize, estimate->aggSize);
+	mainTotalSize = add_size(mainTotalSize, estimate->centerCountsSize);
+	mainTotalSize = add_size(mainTotalSize, estimate->closestCentersSize);
+	mainTotalSize = add_size(mainTotalSize, estimate->upperBoundSize);
+	mainTotalSize = add_size(mainTotalSize, estimate->groupLowerBoundSize);
+	mainTotalSize = add_size(mainTotalSize, estimate->centerGroupSize);
+	mainTotalSize = add_size(mainTotalSize, estimate->groupOffsetsSize);
+	mainTotalSize = add_size(mainTotalSize, estimate->groupMembersSize);
+	mainTotalSize = add_size(mainTotalSize, estimate->groupCountsSize);
+	mainTotalSize = add_size(mainTotalSize, estimate->centerDriftSize);
+	mainTotalSize = add_size(mainTotalSize, estimate->groupMaxDriftSize);
+	mainTotalSize = add_size(mainTotalSize, estimate->tmpGroupFloatSize);
+	mainTotalSize = add_size(mainTotalSize, estimate->tmpGroupFloatSize);
+	mainTotalSize = add_size(mainTotalSize, estimate->tmpGroupIntSize);
+	mainTotalSize = add_size(mainTotalSize, estimate->tmpGroupBoolSize);
+	mainTotalSize = add_size(mainTotalSize, estimate->groupCentersSize);
+	mainTotalSize = add_size(mainTotalSize, estimate->groupAggSize);
+	mainTotalSize = add_size(mainTotalSize, estimate->groupBuildMembersPosSize);
+
+	estimate->initTotalSize = add_size(memoryUsed, estimate->initWeightSize);
+	estimate->mainTotalSize = mainTotalSize;
+	estimate->totalSize = Max(estimate->initTotalSize, estimate->mainTotalSize);
+}
+
+/*
+ * Report when no k-means implementation fits the memory budget
+ */
+static void
+ReportKmeansMemoryError(const IvfflatKmeansSelection * selection)
+{
+	const IvfflatKmeansMemoryEstimate *elkan = &selection->elkanEstimate;
+	const IvfflatKmeansMemoryEstimate *yinyang = &selection->yinyangEstimate;
+	Size		requiredSize = Min(elkan->totalSize, yinyang->totalSize);
+
+	ereport(ERROR,
+			(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+			 errmsg("memory required is %zu kB (%zu MB), maintenance_work_mem is %d kB (%zu MB)",
+					KmeansMemorySizeToKB(requiredSize), KmeansMemorySizeToMB(requiredSize),
+					maintenance_work_mem, KmeansMemoryKBToMB((Size) maintenance_work_mem)),
+			 errdetail("IVFFlat k-means memory estimates: samples=%d, lists=%d, dimensions=%d, yinyang_groups=%d, maintenance_work_mem=%d kB (%zu MB), Elkan=%zu kB (%zu MB), Yinyang=%zu kB (%zu MB); Elkan lowerBound=%zu kB (%zu MB), Yinyang groupLowerBound=%zu kB (%zu MB).",
+					   yinyang->numSamples, yinyang->numCenters, yinyang->dimensions, yinyang->numGroups,
+					   maintenance_work_mem, KmeansMemoryKBToMB((Size) maintenance_work_mem),
+					   KmeansMemorySizeToKB(elkan->totalSize), KmeansMemorySizeToMB(elkan->totalSize),
+					   KmeansMemorySizeToKB(yinyang->totalSize), KmeansMemorySizeToMB(yinyang->totalSize),
+					   KmeansMemorySizeToKB(elkan->lowerBoundSize), KmeansMemorySizeToMB(elkan->lowerBoundSize),
+					   KmeansMemorySizeToKB(yinyang->groupLowerBoundSize), KmeansMemorySizeToMB(yinyang->groupLowerBoundSize)),
+			 errhint("Increase maintenance_work_mem above the smaller estimated requirement, or reduce lists.")));
+}
+
+/*
+ * Select k-means algorithm based only on memory feasibility.
+ */
+static IvfflatKmeansSelection
+SelectKmeansAlgorithm(VectorArray samples, VectorArray centers, Size memoryUsed)
+{
+	IvfflatKmeansSelection selection;
+	bool		elkanFits;
+	bool		yinyangFits;
+
+	memset(&selection, 0, sizeof(IvfflatKmeansSelection));
+
+	EstimateElkanKmeansMemory(samples->length, centers->maxlen, centers->dim, centers->itemsize, memoryUsed, &selection.elkanEstimate);
+	EstimateYinyangKmeansMemory(samples->length, centers->maxlen, centers->dim, centers->itemsize, memoryUsed, &selection.yinyangEstimate);
+
+	elkanFits = IvfflatKmeansMemoryFits(selection.elkanEstimate.totalSize);
+	yinyangFits = IvfflatKmeansMemoryFits(selection.yinyangEstimate.totalSize);
+
+	if (elkanFits)
+	{
+		selection.algorithm = IVFFLAT_KMEANS_ELKAN;
+		ereport(DEBUG1,
+				(errmsg("using Elkan k-means for IVFFlat build: Elkan fits maintenance_work_mem (Elkan=%zu kB/%zu MB, Yinyang=%zu kB/%zu MB, maintenance_work_mem=%d kB/%zu MB)",
+						KmeansMemorySizeToKB(selection.elkanEstimate.totalSize),
+						KmeansMemorySizeToMB(selection.elkanEstimate.totalSize),
+						KmeansMemorySizeToKB(selection.yinyangEstimate.totalSize),
+						KmeansMemorySizeToMB(selection.yinyangEstimate.totalSize),
+						maintenance_work_mem, KmeansMemoryKBToMB((Size) maintenance_work_mem))));
+	}
+	else if (yinyangFits)
+	{
+		selection.algorithm = IVFFLAT_KMEANS_YINYANG;
+		ereport(DEBUG1,
+				(errmsg("using Yinyang k-means for IVFFlat build: Elkan exceeds maintenance_work_mem and Yinyang fits (Elkan=%zu kB/%zu MB, Yinyang=%zu kB/%zu MB, maintenance_work_mem=%d kB/%zu MB)",
+						KmeansMemorySizeToKB(selection.elkanEstimate.totalSize),
+						KmeansMemorySizeToMB(selection.elkanEstimate.totalSize),
+						KmeansMemorySizeToKB(selection.yinyangEstimate.totalSize),
+						KmeansMemorySizeToMB(selection.yinyangEstimate.totalSize),
+						maintenance_work_mem, KmeansMemoryKBToMB((Size) maintenance_work_mem))));
+	}
+	else
+	{
+		selection.algorithm = IVFFLAT_KMEANS_YINYANG;
+		ReportKmeansMemoryError(&selection);
+	}
+
+	return selection;
+}
+
 /*
  * Initialize with kmeans++
  *
  * https://theory.stanford.edu/~sergei/papers/kMeansPP-soda.pdf
  */
 static void
-InitCenters(Relation index, VectorArray samples, VectorArray centers, float *lowerBound)
+InitCenters(Relation index, VectorArray samples, VectorArray centers, float *lowerBound, Size weightSize)
 {
 	FmgrInfo   *procinfo;
 	Oid			collation;
-	float	   *weight = palloc_array_checked(float, samples->length);
+	float	   *weight = palloc(weightSize);
 	int			numCenters = centers->maxlen;
 	int			numSamples = samples->length;
 
@@ -75,6 +333,72 @@ InitCenters(Relation index, VectorArray samples, VectorArray centers, float *low
 			break;
 
 		/* Choose new center using weighted probability distribution. */
+		choice = sum * RandomDouble();
+		for (j = 0; j < numSamples - 1; j++)
+		{
+			choice -= weight[j];
+			if (choice <= 0)
+				break;
+		}
+
+		VectorArraySet(centers, i + 1, VectorArrayGet(samples, j));
+		centers->length++;
+	}
+
+	pfree(weight);
+}
+
+/*
+ * Initialize with kmeans++ without storing per-sample-per-center bounds.
+ */
+static void
+InitCentersLowMemory(Relation index, VectorArray samples, VectorArray centers, Size weightSize)
+{
+	FmgrInfo   *procinfo;
+	Oid			collation;
+	float	   *weight = palloc(weightSize);
+	int			numCenters = centers->maxlen;
+	int			numSamples = samples->length;
+
+	procinfo = index_getprocinfo(index, 1, IVFFLAT_KMEANS_DISTANCE_PROC);
+	collation = index->rd_indcollation[0];
+
+	/* Choose an initial center uniformly at random */
+	VectorArraySet(centers, 0, VectorArrayGet(samples, RandomInt() % samples->length));
+	centers->length++;
+
+	for (int i = 0; i < numSamples; i++)
+		weight[i] = FLT_MAX;
+
+	for (int i = 0; i < numCenters; i++)
+	{
+		int			j;
+		double		sum;
+		double		choice;
+
+		CHECK_FOR_INTERRUPTS();
+
+		sum = 0.0;
+
+		for (j = 0; j < numSamples; j++)
+		{
+			Datum		vec = PointerGetDatum(VectorArrayGet(samples, j));
+			double		distance;
+
+			distance = DatumGetFloat8(FunctionCall2Coll(procinfo, collation, vec, PointerGetDatum(VectorArrayGet(centers, i))));
+
+			/* Use distance squared for weighted probability distribution */
+			distance *= distance;
+
+			if (distance < weight[j])
+				weight[j] = distance;
+
+			sum += weight[j];
+		}
+
+		if (i + 1 == numCenters)
+			break;
+
 		choice = sum * RandomDouble();
 		for (j = 0; j < numSamples - 1; j++)
 		{
@@ -235,6 +559,357 @@ ComputeNewCenters(VectorArray samples, float *agg, VectorArray newCenters, int *
 		NormCenters(typeInfo, collation, newCenters);
 }
 
+static void
+YinyangBuildMembers(int numCenters, int numGroups, int *centerGroup, int *groupOffsets, int *groupMembers, int *groupCounts)
+{
+	int		   *pos = palloc0_array(int, numGroups);
+
+	memset(groupCounts, 0, sizeof(int) * numGroups);
+	for (int i = 0; i < numCenters; i++)
+		groupCounts[centerGroup[i]]++;
+
+	groupOffsets[0] = 0;
+	for (int g = 0; g < numGroups; g++)
+	{
+		groupOffsets[g + 1] = groupOffsets[g] + groupCounts[g];
+		pos[g] = groupOffsets[g];
+	}
+
+	for (int i = 0; i < numCenters; i++)
+		groupMembers[pos[centerGroup[i]]++] = i;
+
+	pfree(pos);
+}
+
+static void
+YinyangGroupInitialCenters(Relation index, VectorArray centers, const IvfflatTypeInfo * typeInfo,
+						   int numGroups, int *centerGroup, int *groupOffsets, int *groupMembers,
+						   int *groupCounts)
+{
+	FmgrInfo   *procinfo = index_getprocinfo(index, 1, IVFFLAT_KMEANS_DISTANCE_PROC);
+	FmgrInfo   *normprocinfo = IvfflatOptionalProcInfo(index, IVFFLAT_KMEANS_NORM_PROC);
+	Oid			collation = index->rd_indcollation[0];
+	int			numCenters = centers->length;
+	int			dimensions = centers->dim;
+	VectorArray groupCenters = VectorArrayInit(numGroups, dimensions, centers->itemsize);
+	float	   *agg = palloc0_array(float, (Size) numGroups * dimensions);
+
+	groupCenters->length = numGroups;
+	for (int g = 0; g < numGroups; g++)
+	{
+		int			center = (int) (((int64) g * numCenters) / numGroups);
+
+		VectorArraySet(groupCenters, g, VectorArrayGet(centers, center));
+	}
+
+	for (int iter = 0; iter < 5; iter++)
+	{
+		memset(groupCounts, 0, sizeof(int) * numGroups);
+
+		for (int c = 0; c < numCenters; c++)
+		{
+			Datum		vec = PointerGetDatum(VectorArrayGet(centers, c));
+			float		bestDistance = FLT_MAX;
+			int			bestGroup = 0;
+
+			for (int g = 0; g < numGroups; g++)
+			{
+				float		distance = DatumGetFloat8(FunctionCall2Coll(procinfo, collation, vec, PointerGetDatum(VectorArrayGet(groupCenters, g))));
+
+				if (distance < bestDistance)
+				{
+					bestDistance = distance;
+					bestGroup = g;
+				}
+			}
+
+			centerGroup[c] = bestGroup;
+			groupCounts[bestGroup]++;
+		}
+
+		memset(agg, 0, sizeof(float) * (Size) numGroups * dimensions);
+		for (int c = 0; c < numCenters; c++)
+			typeInfo->sumCenter(VectorArrayGet(centers, c), agg + (Size) centerGroup[c] * dimensions);
+
+		for (int g = 0; g < numGroups; g++)
+		{
+			float	   *x = agg + (Size) g * dimensions;
+
+			if (groupCounts[g] == 0)
+				continue;
+
+			for (int d = 0; d < dimensions; d++)
+				x[d] /= groupCounts[g];
+
+			typeInfo->updateCenter(VectorArrayGet(groupCenters, g), dimensions, x);
+		}
+
+		if (normprocinfo != NULL)
+			NormCenters(typeInfo, collation, groupCenters);
+	}
+
+	YinyangBuildMembers(numCenters, numGroups, centerGroup, groupOffsets, groupMembers, groupCounts);
+
+	for (int g = 0; g < numGroups; g++)
+	{
+		if (groupCounts[g] == 0)
+		{
+			int			center = g % numCenters;
+			int			oldGroup = centerGroup[center];
+
+			centerGroup[center] = g;
+			groupCounts[oldGroup]--;
+			groupCounts[g]++;
+		}
+	}
+
+	YinyangBuildMembers(numCenters, numGroups, centerGroup, groupOffsets, groupMembers, groupCounts);
+
+	VectorArrayFree(groupCenters);
+	pfree(agg);
+}
+
+/*
+ * Yinyang k-means variant for IVFFlat using Global and Group filters.
+ *
+ * Based on the Global Filter + Group Filter idea from Ding et al.,
+ * "Yinyang K-Means: A Drop-In Replacement of the Classic K-Means in
+ * Classification and Clustering".
+ */
+static void
+YinyangKmeans(Relation index, VectorArray samples, VectorArray centers, const IvfflatTypeInfo * typeInfo, const IvfflatKmeansMemoryEstimate * memoryEstimate)
+{
+	FmgrInfo   *procinfo;
+	FmgrInfo   *normprocinfo;
+	Oid			collation;
+	int			dimensions = centers->dim;
+	int			numCenters = centers->maxlen;
+	int			numSamples = samples->length;
+	int			numGroups = Max(numCenters / 10, 1);
+	VectorArray newCenters;
+	float	   *agg;
+	int		   *centerCounts;
+	int		   *closestCenters;
+	float	   *upperBound;
+	float	   *groupLowerBound;
+	int		   *centerGroup;
+	int		   *groupOffsets;
+	int		   *groupMembers;
+	int		   *groupCounts;
+	float	   *centerDrift;
+	float	   *groupMaxDrift;
+	float	   *scanMin1;
+	float	   *scanMin2;
+	int		   *scanMinCenter;
+	bool	   *groupScanned;
+
+	IvfflatCheckMemoryUsage(memoryEstimate->totalSize);
+
+	InitCentersLowMemory(index, samples, centers, memoryEstimate->initWeightSize);
+
+	numSamples = samples->length;
+	numCenters = centers->length;
+	numGroups = memoryEstimate->numGroups;
+
+	procinfo = index_getprocinfo(index, 1, IVFFLAT_KMEANS_DISTANCE_PROC);
+	normprocinfo = IvfflatOptionalProcInfo(index, IVFFLAT_KMEANS_NORM_PROC);
+	collation = index->rd_indcollation[0];
+
+	agg = palloc(memoryEstimate->aggSize);
+	centerCounts = palloc(memoryEstimate->centerCountsSize);
+	closestCenters = palloc(memoryEstimate->closestCentersSize);
+	upperBound = palloc(memoryEstimate->upperBoundSize);
+	groupLowerBound = palloc_extended(memoryEstimate->groupLowerBoundSize, MCXT_ALLOC_HUGE);
+	centerGroup = palloc(memoryEstimate->centerGroupSize);
+	groupOffsets = palloc(memoryEstimate->groupOffsetsSize);
+	groupMembers = palloc(memoryEstimate->groupMembersSize);
+	groupCounts = palloc(memoryEstimate->groupCountsSize);
+	centerDrift = palloc0(memoryEstimate->centerDriftSize);
+	groupMaxDrift = palloc0(memoryEstimate->groupMaxDriftSize);
+	scanMin1 = palloc(memoryEstimate->tmpGroupFloatSize);
+	scanMin2 = palloc(memoryEstimate->tmpGroupFloatSize);
+	scanMinCenter = palloc(memoryEstimate->tmpGroupIntSize);
+	groupScanned = palloc(memoryEstimate->tmpGroupBoolSize);
+
+	newCenters = VectorArrayInit(numCenters, dimensions, centers->itemsize);
+	newCenters->length = numCenters;
+
+	YinyangGroupInitialCenters(index, centers, typeInfo, numGroups, centerGroup, groupOffsets, groupMembers, groupCounts);
+
+	/* Initialize assignments and exact per-group lower bounds from frozen centers. */
+	for (int j = 0; j < numSamples; j++)
+	{
+		Datum		vec = PointerGetDatum(VectorArrayGet(samples, j));
+		float		bestDistance = FLT_MAX;
+		int			bestCenter = 0;
+
+		for (int g = 0; g < numGroups; g++)
+		{
+			scanMin1[g] = FLT_MAX;
+			scanMin2[g] = FLT_MAX;
+			scanMinCenter[g] = -1;
+		}
+
+		for (int c = 0; c < numCenters; c++)
+		{
+			int			g = centerGroup[c];
+			float		distance = DatumGetFloat8(FunctionCall2Coll(procinfo, collation, vec, PointerGetDatum(VectorArrayGet(centers, c))));
+
+			if (distance < scanMin1[g])
+			{
+				scanMin2[g] = scanMin1[g];
+				scanMin1[g] = distance;
+				scanMinCenter[g] = c;
+			}
+			else if (distance < scanMin2[g])
+				scanMin2[g] = distance;
+
+			if (distance < bestDistance)
+			{
+				bestDistance = distance;
+				bestCenter = c;
+			}
+		}
+
+		closestCenters[j] = bestCenter;
+		upperBound[j] = bestDistance;
+		for (int g = 0; g < numGroups; g++)
+			groupLowerBound[(Size) j * numGroups + g] = scanMinCenter[g] == bestCenter ? scanMin2[g] : scanMin1[g];
+	}
+
+	for (int iteration = 0; iteration < 500; iteration++)
+	{
+		int			changes = 0;
+
+		CHECK_FOR_INTERRUPTS();
+		for (int j = 0; j < numSamples; j++)
+		{
+			int			oldCenter = closestCenters[j];
+			int			oldGroup = centerGroup[oldCenter];
+			int			bestCenter = oldCenter;
+			float		bestDistance = upperBound[j];
+			float		oldAssignedDistance = upperBound[j];
+			bool		globallyPruned = true;
+			bool		assignedRecomputed = false;
+
+			for (int g = 0; g < numGroups; g++)
+			{
+				float		effective = groupLowerBound[(Size) j * numGroups + g] - groupMaxDrift[g];
+
+				if (effective < 0)
+					effective = 0;
+				if (bestDistance > effective)
+				{
+					globallyPruned = false;
+					break;
+				}
+			}
+
+			if (globallyPruned)
+				continue;
+
+			for (int g = 0; g < numGroups; g++)
+			{
+				groupScanned[g] = false;
+				scanMin1[g] = FLT_MAX;
+				scanMin2[g] = FLT_MAX;
+				scanMinCenter[g] = -1;
+			}
+
+			/* Recompute the assigned-center distance once before exact group scans. */
+			oldAssignedDistance = DatumGetFloat8(FunctionCall2Coll(procinfo, collation, PointerGetDatum(VectorArrayGet(samples, j)), PointerGetDatum(VectorArrayGet(centers, oldCenter))));
+			bestDistance = oldAssignedDistance;
+			upperBound[j] = oldAssignedDistance;
+			assignedRecomputed = true;
+
+			for (int g = 0; g < numGroups; g++)
+			{
+				float		effective = groupLowerBound[(Size) j * numGroups + g] - groupMaxDrift[g];
+
+				if (effective < 0)
+					effective = 0;
+
+				if (bestDistance <= effective)
+				{
+					groupLowerBound[(Size) j * numGroups + g] = effective;
+					continue;
+				}
+
+				groupScanned[g] = true;
+
+				for (int p = groupOffsets[g]; p < groupOffsets[g + 1]; p++)
+				{
+					int			c = groupMembers[p];
+					float		distance;
+
+					if (c == oldCenter)
+						distance = oldAssignedDistance;
+					else
+						distance = DatumGetFloat8(FunctionCall2Coll(procinfo, collation, PointerGetDatum(VectorArrayGet(samples, j)), PointerGetDatum(VectorArrayGet(centers, c))));
+
+					if (distance < scanMin1[g])
+					{
+						scanMin2[g] = scanMin1[g];
+						scanMin1[g] = distance;
+						scanMinCenter[g] = c;
+					}
+					else if (distance < scanMin2[g])
+						scanMin2[g] = distance;
+
+					if (distance < bestDistance)
+					{
+						bestDistance = distance;
+						bestCenter = c;
+					}
+				}
+			}
+
+			if (bestCenter != oldCenter)
+			{
+				closestCenters[j] = bestCenter;
+				changes++;
+			}
+			upperBound[j] = bestDistance;
+
+			for (int g = 0; g < numGroups; g++)
+			{
+				float		bound;
+
+				if (groupScanned[g])
+					bound = scanMinCenter[g] == bestCenter ? scanMin2[g] : scanMin1[g];
+				else
+				{
+					bound = groupLowerBound[(Size) j * numGroups + g];
+					if (g == oldGroup && bestCenter != oldCenter && assignedRecomputed && oldAssignedDistance < bound)
+						bound = oldAssignedDistance;
+				}
+
+				groupLowerBound[(Size) j * numGroups + g] = bound;
+			}
+		}
+		ComputeNewCenters(samples, agg, newCenters, centerCounts, closestCenters, normprocinfo, collation, typeInfo);
+
+		memset(groupMaxDrift, 0, memoryEstimate->groupMaxDriftSize);
+		for (int c = 0; c < numCenters; c++)
+		{
+			float		drift = DatumGetFloat8(FunctionCall2Coll(procinfo, collation, PointerGetDatum(VectorArrayGet(centers, c)), PointerGetDatum(VectorArrayGet(newCenters, c))));
+
+			centerDrift[c] = drift;
+			if (drift > groupMaxDrift[centerGroup[c]])
+				groupMaxDrift[centerGroup[c]] = drift;
+		}
+
+		for (int j = 0; j < numSamples; j++)
+			upperBound[j] += centerDrift[closestCenters[j]];
+
+		for (int c = 0; c < numCenters; c++)
+			VectorArraySet(centers, c, VectorArrayGet(newCenters, c));
+
+		if (changes == 0 && iteration != 0)
+			break;
+	}
+}
+
 /*
  * Use Elkan for performance. This requires distance function to satisfy triangle inequality.
  *
@@ -244,7 +919,7 @@ ComputeNewCenters(VectorArray samples, float *agg, VectorArray newCenters, int *
  * https://www.aaai.org/Papers/ICML/2003/ICML03-022.pdf
  */
 static void
-ElkanKmeans(Relation index, VectorArray samples, VectorArray centers, const IvfflatTypeInfo * typeInfo, Size memoryUsed)
+ElkanKmeans(Relation index, VectorArray samples, VectorArray centers, const IvfflatTypeInfo * typeInfo, const IvfflatKmeansMemoryEstimate * memoryEstimate)
 {
 	FmgrInfo   *procinfo;
 	FmgrInfo   *normprocinfo;
@@ -262,32 +937,8 @@ ElkanKmeans(Relation index, VectorArray samples, VectorArray centers, const Ivff
 	float	   *halfcdist;
 	float	   *newcdist;
 
-	/* Calculate allocation sizes */
-	Size		newCentersSize = VECTOR_ARRAY_SIZE(numCenters, centers->itemsize);
-	Size		aggSize = mul_size(sizeof(float), mul_size(numCenters, dimensions));
-	Size		centerCountsSize = mul_size(sizeof(int), numCenters);
-	Size		closestCentersSize = mul_size(sizeof(int), numSamples);
-	Size		lowerBoundSize = mul_size(sizeof(float), mul_size(numSamples, numCenters));
-	Size		upperBoundSize = mul_size(sizeof(float), numSamples);
-	Size		sSize = mul_size(sizeof(float), numCenters);
-	Size		halfcdistSize = mul_size(sizeof(float), mul_size(numCenters, numCenters));
-	Size		newcdistSize = mul_size(sizeof(float), numCenters);
-
-	/* Calculate total size */
-	Size		totalSize = memoryUsed;
-
-	totalSize = add_size(totalSize, newCentersSize);
-	totalSize = add_size(totalSize, aggSize);
-	totalSize = add_size(totalSize, centerCountsSize);
-	totalSize = add_size(totalSize, closestCentersSize);
-	totalSize = add_size(totalSize, lowerBoundSize);
-	totalSize = add_size(totalSize, upperBoundSize);
-	totalSize = add_size(totalSize, sSize);
-	totalSize = add_size(totalSize, halfcdistSize);
-	totalSize = add_size(totalSize, newcdistSize);
-
 	/* Check memory requirements */
-	IvfflatCheckMemoryUsage(totalSize);
+	IvfflatCheckMemoryUsage(memoryEstimate->totalSize);
 
 	/* Ensure indexing does not overflow */
 	if (numCenters > INT_MAX / numCenters)
@@ -300,25 +951,25 @@ ElkanKmeans(Relation index, VectorArray samples, VectorArray centers, const Ivff
 
 	/* Allocate space */
 	/* Use float instead of double to save memory */
-	agg = palloc(aggSize);
-	centerCounts = palloc(centerCountsSize);
-	closestCenters = palloc(closestCentersSize);
-	lowerBound = palloc_extended(lowerBoundSize, MCXT_ALLOC_HUGE);
-	upperBound = palloc(upperBoundSize);
-	s = palloc(sSize);
-	halfcdist = palloc_extended(halfcdistSize, MCXT_ALLOC_HUGE);
-	newcdist = palloc(newcdistSize);
+	agg = palloc(memoryEstimate->aggSize);
+	centerCounts = palloc(memoryEstimate->centerCountsSize);
+	closestCenters = palloc(memoryEstimate->closestCentersSize);
+	lowerBound = palloc_extended(memoryEstimate->lowerBoundSize, MCXT_ALLOC_HUGE);
+	upperBound = palloc(memoryEstimate->upperBoundSize);
+	s = palloc(memoryEstimate->sSize);
+	halfcdist = palloc_extended(memoryEstimate->halfcdistSize, MCXT_ALLOC_HUGE);
+	newcdist = palloc(memoryEstimate->newcdistSize);
 
 	/* Initialize new centers */
 	newCenters = VectorArrayInit(numCenters, dimensions, centers->itemsize);
 	newCenters->length = numCenters;
 
 #ifdef IVFFLAT_MEMORY
-	ShowMemoryUsage(MemoryContextGetParent(CurrentMemoryContext), totalSize);
+	ShowMemoryUsage(MemoryContextGetParent(CurrentMemoryContext), memoryEstimate->totalSize);
 #endif
 
 	/* Pick initial centers */
-	InitCenters(index, samples, centers, lowerBound);
+	InitCenters(index, samples, centers, lowerBound, memoryEstimate->initWeightSize);
 
 	/* Assign each x to its closest initial center c(x) = argmin d(x,c) */
 	for (int j = 0; j < numSamples; j++)
@@ -561,7 +1212,14 @@ IvfflatKmeans(Relation index, VectorArray samples, VectorArray centers, const Iv
 	if (samples->length == 0)
 		RandomCenters(index, centers, typeInfo);
 	else
-		ElkanKmeans(index, samples, centers, typeInfo, memoryUsed);
+	{
+		IvfflatKmeansSelection selection = SelectKmeansAlgorithm(samples, centers, memoryUsed);
+
+		if (selection.algorithm == IVFFLAT_KMEANS_YINYANG)
+			YinyangKmeans(index, samples, centers, typeInfo, &selection.yinyangEstimate);
+		else
+			ElkanKmeans(index, samples, centers, typeInfo, &selection.elkanEstimate);
+	}
 
 	CheckCenters(index, centers, typeInfo);
 
