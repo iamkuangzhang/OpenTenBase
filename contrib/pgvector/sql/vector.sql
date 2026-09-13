@@ -269,6 +269,10 @@ CREATE FUNCTION ivfflat_halfvec_support(internal) RETURNS internal
 CREATE FUNCTION ivfflat_bit_support(internal) RETURNS internal
 	AS 'MODULE_PATHNAME' LANGUAGE C;
 
+CREATE FUNCTION ivfflat_index_diagnostics(regclass, OUT severity text, OUT issue text, OUT current_value text, OUT recommended_value text, OUT detail text)
+	RETURNS SETOF record
+	AS 'MODULE_PATHNAME' LANGUAGE C STABLE STRICT;
+
 CREATE FUNCTION hnsw_halfvec_support(internal) RETURNS internal
 	AS 'MODULE_PATHNAME' LANGUAGE C;
 
