@@ -1,28 +1,12 @@
-# Rhino-Bird IVFFlat Reproduction Materials
+# Rhino-Bird IVFFlat 自适应构建复现材料
 
-This directory is the reviewer entry point for the Rhino-Bird IVFFlat adaptive build submission in OpenTenBase.
+本目录用于展示本项目在 OpenTenBase / pgvector 中对 IVFFlat 索引构建与诊断能力的增强。
 
-## Minimal Smoke Reproduction
+原有 IVFFlat 构建路径主要使用 Elkan K-Means。当其估算内存超过 `maintenance_work_mem` 时，索引构建可能失败。本项目保留原有 Elkan 路径，并在 Elkan 内存不足、Yinyang 可以满足内存约束时，自动切换到更低内存的 Yinyang K-Means 构建路径。同时增加了 IVFFlat 参数与构建内存诊断能力。
 
-Run from the OpenTenBase repository root:
+## 快速复现
+
+在 OpenTenBase 仓库根目录执行：
 
 ```bash
 bash contrib/pgvector/bench/rhino/reproduce_smoke.sh
-```
-
-The script creates a temporary local database, generates deterministic small vectors, builds an IVFFlat index, verifies that the memory-aware path can fall back from Elkan to Yinyang k-means when appropriate, checks that the IVFFlat index is usable by a query, and validates the diagnostic SQL output. It prints explicit PASS/FAIL lines and does not download datasets.
-
-This smoke test is a minimal functional reproduction. It is not the full SIFT/GloVe/GIST benchmark used for the paper-level evaluation.
-
-## Technical Reports
-
-- `docs/IVFFlat_Adaptive_Build_Technical_Report.pdf`
-  - Technical report and reproduction guide for the IVFFlat memory-adaptive build and diagnostics work.
-
-- `docs/IVFFlat_Experiment_Environment_and_Results.pdf`
-  - Experiment environment, dataset, and detailed result evidence for the SIFT/GloVe/GIST evaluation.
-
-## Notes
-
-- Production code lives under `contrib/pgvector/src/`, `contrib/pgvector/sql/`, and `contrib/pgvector/test/`.
-- This `bench/rhino/` directory only contains reviewer-facing reproduction material and documentation.
