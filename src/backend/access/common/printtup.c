@@ -515,6 +515,11 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 	}
 
 #ifdef PGXC
+	/*
+	 * 在判断是否可以直接转发 DataRow 之前，
+	 * 必须先初始化各列的格式信息，以确保能够正确识别
+	 * 客户端请求的文本格式或二进制格式。
+	 */
 	/* Set or update my derived attribute info, if needed */
 	if (myState->attrinfo != typeinfo || myState->nattrs != natts)
 		printtup_prepare_info(myState, typeinfo, natts);
@@ -533,6 +538,13 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 			binary = true;
 	}
 
+	/*
+	 * 只有当客户端请求的所有结果列均为文本格式时，
+	 * 才允许直接转发原始 DataRow。
+	 *
+	 * 如果客户端请求二进制格式，则必须经过解码和重新编码，
+	 * 避免将 DN 返回的文本数据直接发送给期望二进制数据的客户端。
+	 */
 	/*
 	 * If we are having DataRow-based tuple we do not have to encode attribute
 	 * values, just send over the DataRow message as we received it from the
